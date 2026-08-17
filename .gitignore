@@ -12,6 +12,7 @@ __pycache__/
 build/
 dist/
 *.spec
+!build.spec
 
 # 分发压缩包
 dist.7z
