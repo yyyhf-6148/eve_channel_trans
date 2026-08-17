@@ -7,6 +7,8 @@ PyInstaller 打包后（frozen）__file__ 指向临时解压目录，
 import json
 import os
 import sys
+import time
+import traceback
 
 if getattr(sys, "frozen", False):
     APP_DIR = os.path.dirname(os.path.abspath(sys.executable))
@@ -39,6 +41,7 @@ DEFAULTS = {
         "pos_x": None,
         "pos_y": None,
         "positions": {},
+        "pinned": {},
     },
 }
 
@@ -83,6 +86,21 @@ def save_config():
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
     os.replace(tmp, CONFIG_PATH)
+
+
+def log_error(message, exc=None):
+    """追加写入 exe 同目录的 error.log，带时间戳；exc 可为异常对象或文本。"""
+    try:
+        lines = [f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}"]
+        if isinstance(exc, BaseException):
+            lines.append("".join(traceback.format_exception(
+                type(exc), exc, exc.__traceback__)).rstrip())
+        elif exc:
+            lines.append(str(exc))
+        with open(os.path.join(APP_DIR, "error.log"), "a", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+    except Exception:
+        pass
 
 
 def get(key_path, default=None):

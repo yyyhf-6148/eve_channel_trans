@@ -23,6 +23,7 @@ EVE Online 聊天日志的发现与解析。
 import glob
 import os
 import re
+import threading
 import time
 
 MESSAGE_RE = re.compile(
@@ -33,6 +34,8 @@ LOCAL_PREFIXES = ("本地_", "Local_", "local_")
 SUFFIX_RE = re.compile(r"_(\d{6,})\.txt$")
 
 _header_cache = {}
+_header_lock = threading.Lock()
+_char_lock = threading.Lock()
 
 
 # ---------- 编码 / 基础读取 ----------
@@ -47,12 +50,6 @@ def decode_log_bytes(raw):
         except (UnicodeDecodeError, LookupError):
             continue
     return raw.decode("utf-8", errors="replace")
-
-
-def read_log_file(path):
-    """读取整个日志文件（按内容自动识别编码）。"""
-    with open(path, "rb") as f:
-        return decode_log_bytes(f.read())
 
 
 def parse_message(line):
@@ -189,12 +186,13 @@ def _character_files(log_dir, character):
             mtime = os.stat(sub).st_mtime_ns
         except OSError:
             return []
-        cached = _char_files_cache.get(key)
-        if cached and cached[0] == mtime:
-            return cached[1]
-        result = glob.glob(os.path.join(sub, "*.txt"))
-        _char_files_cache[key] = (mtime, result)
-        return result
+        with _char_lock:
+            cached = _char_files_cache.get(key)
+            if cached and cached[0] == mtime:
+                return cached[1]
+            result = glob.glob(os.path.join(sub, "*.txt"))
+            _char_files_cache[key] = (mtime, result)
+            return result
 
     # 平铺模式：按角色 ID 后缀分组，再按 Listener 字段归属角色
     key = (log_dir, character)
@@ -202,9 +200,10 @@ def _character_files(log_dir, character):
         mtime = os.stat(log_dir).st_mtime_ns
     except OSError:
         return []
-    cached = _char_files_cache.get(key)
-    if cached and cached[0] == mtime:
-        return cached[1]
+    with _char_lock:
+        cached = _char_files_cache.get(key)
+        if cached and cached[0] == mtime:
+            return cached[1]
     groups = {}
     no_suffix = []
     for p in glob.glob(os.path.join(log_dir, "*.txt")):
@@ -220,9 +219,10 @@ def _character_files(log_dir, character):
     for p in no_suffix:
         if character_of_file(p) == character:
             result.append(p)
-    if len(_char_files_cache) > 128:
-        _char_files_cache.clear()
-    _char_files_cache[key] = (mtime, result)
+    with _char_lock:
+        if len(_char_files_cache) > 128:
+            _char_files_cache.clear()
+        _char_files_cache[key] = (mtime, result)
     return result
 
 
@@ -251,9 +251,10 @@ def character_of_file(path):
         st = os.stat(path)
     except OSError:
         return None
-    cached = _header_cache.get(path)
-    if cached and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
-        return cached[2]
+    with _header_lock:
+        cached = _header_cache.get(path)
+        if cached and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
+            return cached[2]
     try:
         with open(path, "rb") as f:
             raw = f.read(4096)
@@ -262,9 +263,10 @@ def character_of_file(path):
     text = decode_log_bytes(raw)
     m = LISTENER_RE.search(text)
     char = m.group(1).strip() if m else None
-    if len(_header_cache) > 2000:
-        _header_cache.clear()
-    _header_cache[path] = (st.st_mtime_ns, st.st_size, char)
+    with _header_lock:
+        if len(_header_cache) > 2000:
+            _header_cache.clear()
+        _header_cache[path] = (st.st_mtime_ns, st.st_size, char)
     return char
 
 

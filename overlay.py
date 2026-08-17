@@ -3,23 +3,36 @@
 
 结构：
 - 控制面板（root）：显示角色/窗口/待翻译状态，提供“设置/退出”；
-- 每个选中频道一个 ChannelOverlay：由“消息窗口 + 标题栏窗口”两个 Toplevel 组成，
-  标题栏窗口始终可点击（含固定按钮），消息窗口在固定后整窗鼠标穿透（WS_EX_TRANSPARENT）。
-  固定后标题栏上的“固定 / ×”按钮隐藏，仅保留独立的“取消固定”小按钮窗口可点击。
+- 每个选中频道一个 ChannelOverlay：单窗口（顶部标题栏 + 消息区 + 底部发送输入框）。
+  未固定时整窗可点，标题栏可拖动、四边/四角可缩放；
+  固定后整窗鼠标穿透（WS_EX_TRANSPARENT），仅独立的“取消固定”小按钮窗口可点击。
+  底部输入框输入中文后回车，翻译成英文并复制到剪贴板，请求会带上最近 10 条消息作为上文。
+
+线程模型：
+- _watch_loop（后台）扫描日志，把带递增序号 seq 的新消息放入 raw_q；
+- 多个 _translate_loop worker（后台）并发翻译，结果带同一 seq 放入 done_q；
+- _poll_done（主线程）按 seq 顺序渲染，保证并发翻译下显示顺序不乱；
+- _send_worker_loop（后台）处理输入框的发送请求（中文→英文，带最近 10 条上文），
+  结果经 send_done_q 回到主线程，由 _poll_done 复制到剪贴板并渲染。
+- self.overlays / self.watchers 由 _lock 保护，避免后台线程与主线程竞态。
 """
 import ctypes
+import itertools
 import os
 import queue
 import threading
 import time
 import tkinter as tk
+from collections import deque
 from tkinter import messagebox, ttk
 
 import eve_logs
-from config import get, set as cfg_set, save_config
+from config import DEFAULTS, get, log_error, set as cfg_set, save_config
+from translator import (NetworkError, RateLimitError, ServerError,
+                        TranslationError, Translator)
 
 # 版本 / 作者信息（显示在设置窗口底部）
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.3.0"
 APP_AUTHOR = "MaoSama"
 
 # Windows 扩展样式
@@ -43,6 +56,13 @@ FG_SPK = "#58a6ff"
 FG_STATUS = "#7d8590"
 BTN_BG = "#24384a"
 BTN_ACTIVE = "#2f4a63"
+
+_WDEF = DEFAULTS["window"]
+
+# 并发翻译 worker 数上限（默认最多同时 3 个请求，兼顾延迟与限流）
+MAX_TRANSLATE_WORKERS = 3
+# 可退避重试的瞬时错误
+_TRANSIENT = (NetworkError, RateLimitError, ServerError)
 
 
 def _hwnd(win):
@@ -71,31 +91,77 @@ def set_click_through(win, enabled):
 
 
 class ChannelOverlay:
-    """单个频道对应的翻译悬浮窗（消息窗口 + 标题栏窗口）。"""
+    """单个频道对应的翻译悬浮窗（单窗口：顶部标题栏 + 消息区）。
 
-    BAR_H = 30
+    未固定：整窗可点，标题栏可拖动窗口，四边/四角可缩放；
+    固定：整窗鼠标穿透（WS_EX_TRANSPARENT），仅独立“取消固定”小按钮可点击。
+    """
+
+    BAR_H = 30    # 标题栏设计高度（取消固定按钮定位用；标题栏本身由 pack 自适应）
+    EDGE = 6      # 边缘缩放判定宽度
+    MIN_W = 240
+    MIN_H = 180   # 总高下限（标题栏 30 + 消息区 + 发送输入框）
 
     def __init__(self, app, channel, character):
         self.app = app
         self.channel = channel
-        self.pinned = False
+        self.pinned = bool((get("window.pinned", {}) or {}).get(channel))
         self._drag = None
         self._resize = None
-        self._pos = None  # 消息窗口屏幕坐标（权威值，避免依赖未映射窗口的实时查询）
+        self._pos = None  # 窗口屏幕坐标（权威值，避免依赖未映射窗口的实时查询）
+        self.recent = deque(maxlen=10)  # 最近消息缓存，作为发送翻译的上文
 
-        w = int(get("window.width", 440))
-        h = int(get("window.height", 340))
-        fs = int(get("window.font_size", 10))
+        w = max(int(get("window.width", _WDEF["width"])), self.MIN_W)
+        h = max(int(get("window.height", _WDEF["height"])), self.MIN_H)
+        fs = int(get("window.font_size", _WDEF["font_size"]))
 
-        # ---------- 消息窗口 ----------
+        # ---------- 主窗口（标题栏 + 消息区，未固定时整窗可点） ----------
         self.win = tk.Toplevel(app.root)
         self.win.withdraw()
         self.win.overrideredirect(True)
         self.win.attributes("-topmost", True)
         self.win.configure(bg=BG)
-        # 消息窗口从标题栏下方开始（不重叠），避免标题栏被消息窗盖住而无法拖动/点按钮
-        self.win.geometry(f"{w}x{max(h - self.BAR_H, 120)}")
+        self.win.geometry(f"{w}x{h}")
 
+        self.header = tk.Frame(self.win, bg=BG_HEADER)
+        self.header.pack(fill="x")
+
+        btn_args = dict(bg=BTN_BG, fg=FG, relief="flat", bd=0, cursor="hand2",
+                        activebackground=BTN_ACTIVE, activeforeground="#ffffff",
+                        font=("Microsoft YaHei UI", 9), padx=8, pady=2)
+        self.title_lbl = tk.Label(self.header, text=f"{channel} · 翻译", bg=BG_HEADER,
+                                  fg=FG, font=("Microsoft YaHei UI", fs + 1, "bold"),
+                                  anchor="w")
+        self.title_lbl.pack(side="left", padx=8, pady=5, fill="x", expand=True)
+        self.btn_close = tk.Button(self.header, text="×",
+                                   command=lambda: app.close_overlay(channel),
+                                   **btn_args)
+        self.btn_close.pack(side="right", padx=(2, 6), pady=4)
+        self.btn_pin = tk.Button(self.header, text="固定", command=self.toggle_pin,
+                                 **btn_args)
+        self.btn_pin.pack(side="right", padx=2, pady=4)
+
+        # ---------- 底部发送输入框：输入中文回车翻译成英文并复制 ----------
+        # 必须先于 text 创建并 pack(side="bottom")：pack 按调用顺序分配空间，
+        # 后 pack 的 text(expand) 会抢占全部剩余空间，把输入框压成 1px
+        self.entry_frame = tk.Frame(self.win, bg=BG)
+        self.entry_frame.pack(side="bottom", fill="x", padx=6, pady=(0, 6))
+        # 翻译状态提示（必须先于 entry pack，否则被 expand 的 entry 抢占宽度）
+        self._send_status_job = None
+        self.send_status = tk.Label(self.entry_frame, text="", bg=BG, fg=FG_DIM,
+                                    anchor="e", width=9,
+                                    font=("Microsoft YaHei UI", 9))
+        self.send_status.pack(side="right", padx=(6, 0))
+        self.entry = tk.Entry(self.entry_frame, bg="#1c242c", fg=FG,
+                              insertbackground=FG, relief="flat",
+                              font=("Microsoft YaHei UI", fs))
+        self.entry.pack(fill="x", ipady=3)
+        self.entry.bind("<Return>", self._submit_send)
+        self.entry.bind("<FocusIn>", self._entry_focus_in)
+        self.entry.bind("<FocusOut>", self._entry_focus_out)
+        self._placeholder = "输入中文，回车翻译成英文并复制"
+        self._entry_ph = False
+        self._set_entry_placeholder()
         self.text = tk.Text(self.win, bg=BG, fg=FG, wrap="word", relief="flat", bd=0,
                             font=("Microsoft YaHei UI", fs), padx=8, pady=6,
                             highlightthickness=0)
@@ -104,40 +170,14 @@ class ChannelOverlay:
         self.text.tag_configure("orig", foreground=FG_DIM)
         self.text.tag_configure("spk", foreground=FG_SPK)
         self.text.tag_configure("trans", foreground=FG)
+        self.text.tag_configure("send", foreground="#79c0ff")
+        self.text.tag_configure("send_ok", foreground="#7ee787")
+        self.text.tag_configure("send_err", foreground="#ff7b72")
         self.text.configure(state="disabled")
         self.text.bind("<Button-3>", self._context_menu)
 
-        # ---------- 标题栏窗口（独立，固定后仍可点击） ----------
-        self.bar = tk.Toplevel(app.root)
-        self.bar.withdraw()
-        self.bar.overrideredirect(True)
-        self.bar.attributes("-topmost", True)
-        self.bar.configure(bg=BG_HEADER)
-
-        btn_args = dict(bg=BTN_BG, fg=FG, relief="flat", bd=0, cursor="hand2",
-                        activebackground=BTN_ACTIVE, activeforeground="#ffffff",
-                        font=("Microsoft YaHei UI", 9), padx=8, pady=2)
-        self.title_lbl = tk.Label(self.bar, text=f"{channel} · 翻译", bg=BG_HEADER,
-                                  fg=FG, font=("Microsoft YaHei UI", fs + 1, "bold"),
-                                  anchor="w")
-        self.title_lbl.pack(side="left", padx=8, pady=5, fill="x", expand=True)
-        self.btn_close = tk.Button(self.bar, text="×",
-                                   command=lambda: app.close_overlay(channel),
-                                   **btn_args)
-        self.btn_close.pack(side="right", padx=(2, 6), pady=4)
-        self.btn_pin = tk.Button(self.bar, text="固定", command=self.toggle_pin,
-                                 **btn_args)
-        self.btn_pin.pack(side="right", padx=2, pady=4)
-
-        self.bar.bind("<ButtonPress-1>", self._start_drag)
-        self.bar.bind("<B1-Motion>", self._do_drag)
-        self.bar.bind("<Button-3>", self._context_menu)
-        self.title_lbl.bind("<ButtonPress-1>", self._start_drag)
-        self.title_lbl.bind("<B1-Motion>", self._do_drag)
-        self.title_lbl.bind("<Button-3>", self._context_menu)
-
         # ---------- 固定后唯一可点击的“取消固定”按钮（独立窗口） ----------
-        # 固定后 win 与 bar 整体点击穿透，只有这个小窗口能点到
+        # 固定后整窗点击穿透，只有这个小窗口能点到
         self.pin_btn_win = tk.Toplevel(app.root)
         self.pin_btn_win.withdraw()
         self.pin_btn_win.overrideredirect(True)
@@ -147,56 +187,89 @@ class ChannelOverlay:
                                        command=self.toggle_pin, **btn_args)
         self.pin_btn_unpin.pack(fill="both", expand=True)
 
-        # 未固定时支持边缘拖动改变大小（鼠标到窗口边缘显示缩放光标）
+        # 拖动：标题栏 / 标题文字（单窗口，移动即整体移动，无需同步）
+        for wdg in (self.header, self.title_lbl):
+            wdg.bind("<ButtonPress-1>", self._start_drag)
+            wdg.bind("<B1-Motion>", self._do_drag)
+            wdg.bind("<Button-3>", self._context_menu)
+        # 缩放：消息区四周边缘；标题栏/标题文字只把顶部边缘/角作为整体窗口的“上”把手
+        # 注意：标题栏已绑定拖动，缩放处理器必须用 add="+" 追加，否则 bind() 默认替换
+        # 会覆盖拖动绑定导致标题栏无法拖动窗口
         for wdg in (self.win, self.text):
             wdg.bind("<Motion>", self._on_motion)
             wdg.bind("<ButtonPress-1>", self._on_resize_start)
             wdg.bind("<B1-Motion>", self._on_resize_drag)
             wdg.bind("<ButtonRelease-1>", self._on_resize_end)
-
-        self.win.bind("<Configure>", self._on_configure)
+        for wdg in (self.header, self.title_lbl):
+            wdg.bind("<Motion>", self._on_motion)
+            wdg.bind("<ButtonPress-1>", self._on_resize_start, add="+")
+            wdg.bind("<B1-Motion>", self._on_resize_drag, add="+")
+            wdg.bind("<ButtonRelease-1>", self._on_resize_end)
 
         self._load_position()
         self._apply_style()
         self.win.deiconify()
-        self.bar.deiconify()
-        self._sync_bar()  # 窗口显示后再同步标题栏位置，避免 withdraw 时坐标无效
-        # 窗口真正映射到屏幕后再兜底同步一次，防止 winfo_rootx 尚未生效
-        self.app.root.after(120, self._sync_bar)
+        if self.pinned:
+            # 恢复上次的固定状态：整窗穿透 + 隐藏标题栏按钮 + 显示取消固定钮
+            set_click_through(self.win, True)
+            self.btn_pin.pack_forget()
+            self.btn_close.pack_forget()
+            self.entry_frame.pack_forget()
+            for wdg in (self.win, self.text):
+                try:
+                    wdg.configure(cursor="arrow")
+                except tk.TclError:
+                    pass
+            self._sync_pin_btn()
+            self.app.root.after(120, self._sync_pin_btn)
+        else:
+            self.pin_btn_win.withdraw()
 
     # ---------- 固定 / 穿透 ----------
     def toggle_pin(self, event=None):
         self.set_pinned(not self.pinned)
 
     def set_pinned(self, pinned):
+        if self.pinned == pinned:
+            return
         self.pinned = pinned
-        set_click_through(self.win, pinned)
-        # 固定后标题栏也整体穿透，除独立“取消固定”按钮外一概点不到
-        set_click_through(self.bar, pinned)
+        self._save_pin_state()
         if pinned:
             # 固定后隐藏标题栏上的“固定 / ×”按钮，只保留独立“取消固定”按钮
+            set_click_through(self.win, True)
             self.btn_pin.pack_forget()
             self.btn_close.pack_forget()
-            self._sync_pin_btn()
+            self.entry_frame.pack_forget()
             for wdg in (self.win, self.text):
                 try:
                     wdg.configure(cursor="arrow")
                 except tk.TclError:
                     pass
+            self._sync_pin_btn()
         else:
             try:
                 self.pin_btn_win.withdraw()
                 # 恢复标题栏上的“固定 / ×”按钮（保持原有左右顺序）
                 self.btn_close.pack(side="right", padx=(2, 6), pady=4)
                 self.btn_pin.pack(side="right", padx=2, pady=4)
-                self.bar.lift()  # 确保标题栏仍在消息窗之上
-                self._sync_bar()  # lift 会重置 bar 坐标，需重新同步
+                # 恢复输入框：必须先于 text 重 pack，否则 text(expand) 抢占全部空间
+                self.text.pack_forget()
+                self.entry_frame.pack(side="bottom", fill="x", padx=6, pady=(0, 6))
+                self.text.pack(fill="both", expand=True)
+                set_click_through(self.win, False)
+                self.win.lift()
             except tk.TclError:
                 pass
 
+    def _save_pin_state(self):
+        pinned = dict(get("window.pinned", {}) or {})
+        pinned[self.channel] = self.pinned
+        cfg_set("window.pinned", pinned)
+        save_config()
+
     # ---------- 位置 / 拖动 ----------
     def _current_win_pos(self):
-        """返回消息窗口的屏幕坐标，优先使用显式维护的 _pos。"""
+        """返回窗口屏幕坐标，优先使用显式维护的 _pos。"""
         if self._pos is not None:
             return self._pos
         try:
@@ -209,55 +282,29 @@ class ChannelOverlay:
             pass
         return self._pos if self._pos is not None else (0, 0)
 
-    def _sync_bar(self):
+    def _screen_bounds(self):
+        """虚拟桌面范围（支持多显示器负坐标），返回 (x, y, w, h)。"""
         try:
-            x, y = self._current_win_pos()
-            self.win.update_idletasks()
-            w = self.win.winfo_width()
-            if w <= 1:
-                w = int(get("window.width", 440))
-            # 注意：overrideredirect 窗口在 Windows 上 lift() 会把坐标重置，
-            # 因此必须先置顶、后设置 geometry
-            self.bar.lift()
-            self.bar.geometry(f"{w}x{self.BAR_H}+{x}+{y - self.BAR_H}")
-            self._sync_pin_btn()
-        except tk.TclError:
-            pass
+            return tuple(_user32.GetSystemMetrics(m) for m in
+                         (76, 77, 78, 79))  # SM_XVIRTUALSCREEN/Y/CXVIRTUALSCREEN/CYVIRTUALSCREEN
+        except Exception:
+            return None
 
-    def _sync_pin_btn(self):
-        """固定后：独立“取消固定”按钮窗口跟随标题栏右侧。"""
-        if not self.pinned:
-            return
-        try:
-            bx = self.bar.winfo_rootx()
-            by = self.bar.winfo_rooty()
-            bw = self.bar.winfo_width()
-            if bw <= 1:
-                bw = int(get("window.width", 440))
-            w = max(self.pin_btn_unpin.winfo_reqwidth(), 88)
-            self.pin_btn_win.deiconify()
-            self.pin_btn_win.lift()
-            # lift 会重置坐标，置顶后再定位
-            self.pin_btn_win.geometry(f"{w}x{self.BAR_H - 8}+{bx + bw - w - 6}+{by + 4}")
-        except tk.TclError:
-            pass
-
-    def _on_configure(self, event):
-        if event.widget is self.win and self.bar.winfo_exists():
-            try:
-                x = self.win.winfo_rootx()
-                y = self.win.winfo_rooty()
-                if x != 0 or y != 0:
-                    self._pos = (x, y)
-            except tk.TclError:
-                pass
-            self._sync_bar()
+    def _clamp_pos(self, x, y):
+        """把窗口位置限制在可见区域内，保证标题栏至少部分可见，避免拖出屏幕找不回。"""
+        b = self._screen_bounds()
+        if not b:
+            return x, y
+        sx, sy, sw, sh = b
+        return min(max(x, sx), sx + sw - 40), min(max(y, sy), sy + sh - 30)
 
     def _start_drag(self, event):
         if self.pinned:  # 固定后禁止拖动
             return
         if event.widget in (self.btn_pin, self.btn_close):
             return
+        if self._resize_region_for(event) is not None:
+            return  # 按在缩放把手上，交给缩放逻辑处理，不启动移动
         # 用屏幕坐标，避免控制面板不在 (0,0) 时拖动错位
         self._drag = (event.x_root - self.win.winfo_rootx(),
                       event.y_root - self.win.winfo_rooty())
@@ -265,16 +312,12 @@ class ChannelOverlay:
     def _do_drag(self, event):
         if self._drag is None or self.pinned:
             return
-        x = event.x_root - self._drag[0]
-        y = event.y_root - self._drag[1]
+        x, y = self._clamp_pos(event.x_root - self._drag[0],
+                               event.y_root - self._drag[1])
         self._pos = (x, y)
         self.win.geometry(f"+{x}+{y}")
-        self._sync_bar()
 
     # ---------- 边缘拖动改变大小（仅未固定时） ----------
-    EDGE = 6
-    MIN_W = 240
-    MIN_H = 120
     _RESIZE_CURSORS = {
         "nw": "size_nw_se", "se": "size_nw_se",
         "ne": "size_ne_sw", "sw": "size_ne_sw",
@@ -282,10 +325,8 @@ class ChannelOverlay:
         "n": "sb_v_double_arrow", "s": "sb_v_double_arrow",
     }
 
-    def _resize_region(self, x, y):
-        """根据窗口内坐标判断所在缩放区域（边/角），窗口内部返回 None。"""
-        w = self.win.winfo_width()
-        h = self.win.winfo_height()
+    def _resize_region(self, x, y, w, h):
+        """根据控件内坐标判断所在缩放区域（边/角），控件内部返回 None。"""
         left = x <= self.EDGE
         right = x >= w - self.EDGE
         top = y <= self.EDGE
@@ -308,10 +349,29 @@ class ChannelOverlay:
             return "s"
         return None
 
+    def _resize_region_for(self, event):
+        """根据事件所在控件返回缩放区域。"""
+        wdg = event.widget
+        if wdg in (self.entry, self.entry_frame):
+            return None  # 输入框区域不触发缩放/拖动，避免误改窗口大小
+        if wdg in (self.header, self.title_lbl):
+            # 标题栏：仅顶部边缘/角作为整体窗口的上边缩放把手
+            if event.y > self.EDGE:
+                return None
+            x = event.x
+            w = self.win.winfo_width()
+            if x <= self.EDGE:
+                return "nw"
+            if x >= w - self.EDGE:
+                return "ne"
+            return "n"
+        return self._resize_region(event.x, event.y,
+                                   wdg.winfo_width(), wdg.winfo_height())
+
     def _on_motion(self, event):
         if self.pinned or self._resize:
             return
-        region = self._resize_region(event.x, event.y)
+        region = self._resize_region_for(event)
         cursor = self._RESIZE_CURSORS.get(region, "arrow")
         self.win.configure(cursor=cursor)
         try:
@@ -322,7 +382,7 @@ class ChannelOverlay:
     def _on_resize_start(self, event):
         if self.pinned:
             return
-        region = self._resize_region(event.x, event.y)
+        region = self._resize_region_for(event)
         if region is None:
             return
         self._resize = {
@@ -353,19 +413,36 @@ class ChannelOverlay:
         if "n" in reg:
             nh = max(nh - dy, self.MIN_H)
             ny = r["gy"] + (r["gh"] - nh)
+        nx, ny = self._clamp_pos(nx, ny)
         self._pos = (nx, ny)
         self.win.geometry(f"{nw}x{nh}+{nx}+{ny}")
-        self._sync_bar()
 
     def _on_resize_end(self, event):
         if self._resize is None:
             return
         self._resize = None
         self.win.update_idletasks()
-        # 记住新尺寸（height 为含标题栏的总高），下次启动恢复
+        # 记住新尺寸（含标题栏的总尺寸），下次启动恢复
         cfg_set("window.width", max(self.win.winfo_width(), self.MIN_W))
-        cfg_set("window.height", max(self.win.winfo_height() + self.BAR_H, self.MIN_H))
-        self._sync_bar()
+        cfg_set("window.height", max(self.win.winfo_height(), self.MIN_H))
+
+    def _sync_pin_btn(self):
+        """固定后：独立“取消固定”按钮窗口跟随主窗口右上角。"""
+        if not self.pinned:
+            return
+        try:
+            x = self.win.winfo_rootx()
+            y = self.win.winfo_rooty()
+            w = self.win.winfo_width()
+            if w <= 1:
+                w = int(get("window.width", _WDEF["width"]))
+            bw = max(self.pin_btn_unpin.winfo_reqwidth(), 88)
+            self.pin_btn_win.deiconify()
+            self.pin_btn_win.lift()
+            # lift 会重置坐标，置顶后再定位
+            self.pin_btn_win.geometry(f"{bw}x{self.BAR_H - 8}+{x + w - bw - 6}+{y + 4}")
+        except tk.TclError:
+            pass
 
     def _load_position(self):
         pos = self.app.get_channel_pos(self.channel)
@@ -382,9 +459,9 @@ class ChannelOverlay:
 
     # ---------- 样式 ----------
     def _apply_style(self):
-        alpha = float(get("window.opacity", 0.85))
-        fs = int(get("window.font_size", 10))
-        for w in (self.win, self.bar, self.pin_btn_win):
+        alpha = float(get("window.opacity", _WDEF["opacity"]))
+        fs = int(get("window.font_size", _WDEF["font_size"]))
+        for w in (self.win, self.pin_btn_win):
             try:
                 w.attributes("-alpha", alpha)
             except tk.TclError:
@@ -393,19 +470,105 @@ class ChannelOverlay:
         self.title_lbl.configure(font=("Microsoft YaHei UI", fs + 1, "bold"))
 
     # ---------- 消息 / 菜单 ----------
-    def add_message(self, item):
-        speaker = item.get("speaker", "")
-        original = item.get("original", "")
-        translated = item.get("translated", "")
+    def add_messages(self, items):
+        """批量插入并渲染消息（一次状态切换/滚动，减少重绘）。"""
+        if not items:
+            return
         self.text.configure(state="normal")
-        if speaker:
-            self.text.insert("end", f"[{speaker}] ", "spk")
-        self.text.insert("end", f"{original}\n", "orig")
-        self.text.insert("end", f"    {translated}\n\n", "trans")
+        for item in items:
+            speaker = item.get("speaker", "")
+            original = item.get("original", "")
+            translated = item.get("translated", "")
+            if speaker:
+                self.text.insert("end", f"[{speaker}] ", "spk")
+            self.text.insert("end", f"{original}\n", "orig")
+            self.text.insert("end", f"    {translated}\n\n", "trans")
+            self.recent.append(item)  # 缓存作为发送翻译的上文
         if float(self.text.index("end-1c")) > 1500:
             self.text.delete("1.0", "300.0")
         self.text.see("end")
         self.text.configure(state="disabled")
+
+    # ---------- 底部输入框：中文→英文 翻译并复制 ----------
+    def _set_entry_placeholder(self):
+        self.entry.delete(0, "end")
+        self.entry.insert(0, self._placeholder)
+        self.entry.configure(fg=FG_DIM)
+        self._entry_ph = True
+
+    def _entry_focus_in(self, event=None):
+        if self._entry_ph:
+            self.entry.delete(0, "end")
+            self.entry.configure(fg=FG)
+            self._entry_ph = False
+
+    def _entry_focus_out(self, event=None):
+        if not self.entry.get().strip():
+            self._set_entry_placeholder()
+
+    def _build_send_context(self):
+        """拼装最近 10 条消息作为翻译上文。"""
+        lines = []
+        for m in self.recent:
+            speaker = m.get("speaker", "")
+            original = m.get("original", "")
+            translated = m.get("translated", "")
+            line = f"[{speaker}] {original}" if speaker else original
+            if translated and not translated.startswith("[翻译失败"):
+                line += f"  → {translated}"
+            lines.append(line)
+        return "\n".join(lines)
+
+    def _submit_send(self, event=None):
+        if self.pinned:
+            return
+        text = self.entry.get().strip()
+        if not text:
+            return
+        self.entry.delete(0, "end")
+        self.entry.configure(fg=FG)
+        self._entry_ph = False
+        # 立即反馈“翻译中”，避免无响应感
+        self._set_send_status("翻译中…", "#79c0ff")
+        self._show_send_row(f"[发送] 我：{text}\n", "send")
+        self.app.submit_send(self.channel, text, self._build_send_context())
+
+    def _set_send_status(self, text, color):
+        """输入框右侧的状态提示；空闲 3 秒后自动清空。"""
+        if self._send_status_job is not None:
+            try:
+                self.win.after_cancel(self._send_status_job)
+            except Exception:
+                pass
+            self._send_status_job = None
+        self.send_status.configure(text=text, fg=color)
+        if text:
+            self._send_status_job = self.win.after(
+                3000, lambda: self._set_send_status("", FG_DIM))
+
+    def _show_send_row(self, text, tag):
+        self.text.configure(state="normal")
+        self.text.insert("end", text, tag)
+        if float(self.text.index("end-1c")) > 1500:
+            self.text.delete("1.0", "300.0")
+        self.text.see("end")
+        self.text.configure(state="disabled")
+
+    def _on_send_result(self, result):
+        """主线程回调：渲染译文并复制到剪贴板。"""
+        if result.get("ok"):
+            translated = result.get("translated", "")
+            self._show_send_row(f"    {translated}  (已复制到剪贴板)\n", "send_ok")
+            self._set_send_status("已复制", "#7ee787")
+            try:
+                self.app.root.clipboard_clear()
+                self.app.root.clipboard_append(translated)
+            except tk.TclError:
+                pass
+        else:
+            err = result.get("error", "") or ""
+            self._show_send_row(f"    [发送失败] {err}\n", "send_err")
+            self._set_send_status("失败", "#ff7b72")
 
     def _context_menu(self, event=None):
         menu = tk.Menu(self.win, tearoff=0, bg=BG_HEADER, fg=FG,
@@ -423,7 +586,7 @@ class ChannelOverlay:
 
     def destroy(self):
         self._save_position()
-        for w in (self.win, self.bar, self.pin_btn_win):
+        for w in (self.win, self.pin_btn_win):
             try:
                 w.destroy()
             except tk.TclError:
@@ -432,12 +595,19 @@ class ChannelOverlay:
 
 class OverlayApp:
     def __init__(self):
-        self.raw_q = queue.Queue()       # 待翻译消息
-        self.done_q = queue.Queue()      # 已翻译结果
+        self.raw_q = queue.Queue()       # 待翻译消息（带递增 seq）
+        self.done_q = queue.Queue()      # 已翻译结果（带同 seq）
+        self.send_q = queue.Queue()      # 输入框发送请求（中文→英文，带上文）
+        self.send_done_q = queue.Queue() # 发送翻译结果
         self.stop_event = threading.Event()
+        self._lock = threading.Lock()    # 保护 overlays / watchers
         self.overlays = {}               # channel -> ChannelOverlay
         self.watchers = {}
         self.translator = None
+        self._workers = []
+        self._seq = itertools.count()
+        self._pending = {}               # seq -> item（排序缓冲，保证显示顺序）
+        self._next_seq = 0
         self._drag = None
         self._settings_open = False
 
@@ -447,7 +617,7 @@ class OverlayApp:
         self.root.attributes("-topmost", True)
         self.root.configure(bg=BG)
 
-        self.font = ("Microsoft YaHei UI", int(get("window.font_size", 10)))
+        self.font = ("Microsoft YaHei UI", int(get("window.font_size", _WDEF["font_size"])))
         self._build_control_panel()
         self.root.deiconify()
         self._load_ctrl_position()
@@ -456,6 +626,7 @@ class OverlayApp:
 
         self._start_workers()
         self.root.after(120, self._poll_done)
+        self.root.after(1000, self._tick_status)  # 定时刷新状态栏
 
         # 首次运行且未填 API Key 时，自动打开设置
         if not get("api.api_key", "").strip():
@@ -533,23 +704,26 @@ class OverlayApp:
     # ---------- 悬浮窗管理 ----------
     def rebuild_overlays(self):
         channels = [c for c in get("eve.channels", []) if c and c.strip()]
-        for ch in list(self.overlays):
-            if ch not in channels:
-                self.overlays[ch].destroy()
-                del self.overlays[ch]
-        base_x = self.root.winfo_rootx() + 40
-        base_y = self.root.winfo_rooty() + 30
-        idx = 0
-        for ch in channels:
-            if ch not in self.overlays:
-                ov = ChannelOverlay(self, ch, get("eve.character", ""))
-                self.overlays[ch] = ov
-                if self.get_channel_pos(ch) is None:  # 级联偏移避免完全重叠
-                    ov._pos = (base_x + 30 * idx, base_y + 30 * idx)
-                    ov.win.geometry(f"+{ov._pos[0]}+{ov._pos[1]}")
-                    ov._sync_bar()
-                idx += 1
-        self.watchers = {ch: None for ch in channels}
+        with self._lock:
+            pinned = dict(get("window.pinned", {}) or {})
+            for ch in list(self.overlays):
+                if ch not in channels:
+                    self.overlays[ch].destroy()
+                    del self.overlays[ch]
+                    pinned.pop(ch, None)  # 关闭窗口时清掉该频道的固定状态
+            cfg_set("window.pinned", pinned)
+            base_x = self.root.winfo_rootx() + 40
+            base_y = self.root.winfo_rooty() + 30
+            idx = 0
+            for ch in channels:
+                if ch not in self.overlays:
+                    ov = ChannelOverlay(self, ch, get("eve.character", ""))
+                    self.overlays[ch] = ov
+                    if self.get_channel_pos(ch) is None:  # 级联偏移避免完全重叠
+                        ov._pos = (base_x + 30 * idx, base_y + 30 * idx)
+                        ov.win.geometry(f"+{ov._pos[0]}+{ov._pos[1]}")
+                    idx += 1
+            self.watchers = {ch: None for ch in channels}
         self._update_ctrl_label()
 
     def close_overlay(self, channel):
@@ -561,36 +735,70 @@ class OverlayApp:
     # ---------- 后台线程 ----------
     def _start_workers(self):
         self.stop_event.clear()
+        self._seq = itertools.count()
+        self._pending = {}
+        self._next_seq = 0
         threading.Thread(target=self._watch_loop, daemon=True).start()
-        threading.Thread(target=self._translate_loop, daemon=True).start()
+        n = max(1, min(len(self.overlays) or 1, MAX_TRANSLATE_WORKERS))
+        self._workers = []
+        for _ in range(n):
+            t = threading.Thread(target=self._translate_loop, daemon=True)
+            t.start()
+            self._workers.append(t)
+        # 输入框发送翻译：单线程串行处理即可（频率低）
+        t = threading.Thread(target=self._send_worker_loop, daemon=True)
+        t.start()
+        self._workers.append(t)
 
     def _restart_workers(self):
         self.stop_event.set()
-        self.watchers = {ch: None for ch in self.overlays}
+        self._pending = {}
+        self._next_seq = 0
+        with self._lock:
+            self.watchers = {ch: None for ch in self.overlays}
         self.raw_q = queue.Queue()
         self.done_q = queue.Queue()
+        self.send_q = queue.Queue()
+        self.send_done_q = queue.Queue()
         self._start_workers()
 
     def _watch_loop(self):
         while not self.stop_event.is_set():
             log_dir = get("eve.log_dir", "")
             character = get("eve.character", "")
-            channels = list(self.overlays.keys())
+            with self._lock:
+                channels = list(self.overlays.keys())
             if log_dir and character and channels:
                 for ch in channels:
-                    w = self.watchers.get(ch)
-                    if (w is None
-                            or w.log_dir != log_dir or w.character != character
-                            or w.channel != ch):
-                        w = eve_logs.ChatLogWatcher(log_dir, character, ch)
-                        self.watchers[ch] = w
+                    with self._lock:
+                        w = self.watchers.get(ch)
+                        if (w is None
+                                or w.log_dir != log_dir or w.character != character
+                                or w.channel != ch):
+                            w = eve_logs.ChatLogWatcher(log_dir, character, ch)
+                            self.watchers[ch] = w
                     try:
                         for msg in w.poll():
                             msg["channel"] = ch
+                            msg["seq"] = next(self._seq)
                             self.raw_q.put(msg)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        log_error(f"[监听] channel={ch} 读取日志异常", e)
             self.stop_event.wait(1.0)
+
+    def _translate_with_retry(self, translator, text, target=None, context=None):
+        """带退避重试的翻译；不可重试错误直接返回失败信息。"""
+        attempts = 3
+        last = None
+        for attempt in range(attempts):
+            try:
+                return translator.translate_to(text, target, context)
+            except _TRANSIENT as e:
+                last = e
+                time.sleep(min(1.5 * (attempt + 1), 8))
+            except TranslationError as e:
+                return f"[翻译失败] {e}"
+        return f"[翻译失败，已重试 {attempts} 次] {last}"
 
     def _translate_loop(self):
         while not self.stop_event.is_set():
@@ -598,48 +806,94 @@ class OverlayApp:
                 msg = self.raw_q.get(timeout=1)
             except queue.Empty:
                 continue
+            channel = msg.get("channel", "")
+            seq = msg.get("seq")
             speaker = msg.get("speaker", "")
             original = msg.get("text", "")
-            channel = msg.get("channel", "")
             if not original.strip():
                 continue
             if not get("api.base_url", "").strip() or not get("api.model", "").strip():
-                self.done_q.put({"channel": channel, "speaker": speaker,
-                                 "original": original,
-                                 "translated": "[未配置 API，请点“设置”]"})
+                translated = "[未配置 API，请点“设置”]"
+            else:
+                if self.translator is None:
+                    self.translator = Translator()
+                translated = self._translate_with_retry(self.translator, original)
+                if translated.startswith("[翻译失败"):
+                    log_error(f"[翻译] channel={channel} {translated}")
+            self.done_q.put({"channel": channel, "seq": seq, "speaker": speaker,
+                             "original": original, "translated": translated})
+
+    def submit_send(self, channel, text, context):
+        """把输入框的中文翻译成英文并复制，经后台线程处理。"""
+        self.send_q.put({"channel": channel, "text": text, "context": context})
+
+    def _send_worker_loop(self):
+        while not self.stop_event.is_set():
+            try:
+                req = self.send_q.get(timeout=1)
+            except queue.Empty:
+                continue
+            channel = req.get("channel", "")
+            text = req.get("text", "")
+            if not text.strip():
                 continue
             if self.translator is None:
-                from translator import Translator
                 self.translator = Translator()
-            result = None
-            err = ""
-            for attempt in range(3):
-                try:
-                    result = self.translator.translate(original)
-                    break
-                except Exception as e:
-                    err = str(e)
-                    time.sleep(1.5 * (attempt + 1))
-            if result is None:
-                result = f"[翻译失败] {err}"
-            self.done_q.put({"channel": channel, "speaker": speaker,
-                             "original": original, "translated": result})
+            try:
+                translated = self._translate_with_retry(
+                    self.translator, text, target="English",
+                    context=req.get("context") or "")
+                ok = not translated.startswith("[翻译失败")
+            except Exception as e:
+                translated = f"[翻译失败] {e}"
+                ok = False
+            if not ok:
+                log_error(f"[发送] channel={channel} {translated}")
+            self.send_done_q.put({"channel": channel, "ok": ok,
+                                  "translated": translated,
+                                  "error": "" if ok else translated})
 
     # ---------- UI 刷新 ----------
     def _poll_done(self):
+        # 先一次性收走全部结果，避免逐条处理时重复进入事件循环
         try:
             while True:
                 item = self.done_q.get_nowait()
-                ov = self.overlays.get(item.get("channel"))
+                self._pending[item["seq"]] = item
+        except queue.Empty:
+            pass
+        batch = {}
+        # 按 seq 连续出列，保证并发翻译下显示顺序不乱
+        while self._next_seq in self._pending:
+            it = self._pending.pop(self._next_seq)
+            batch.setdefault(it.get("channel"), []).append(it)
+            self._next_seq += 1
+        # 防呆：某个请求卡住导致积压过多时，按序号直接全部展示
+        if len(self._pending) > 200:
+            for s in sorted(self._pending):
+                it = self._pending.pop(s)
+                batch.setdefault(it.get("channel"), []).append(it)
+            self._next_seq = s + 1
+        # 每个频道攒批渲染一次，减少 Text 状态切换与重绘
+        for ch, items in batch.items():
+            ov = self.overlays.get(ch)
+            if ov is not None:
+                ov.add_messages(items)
+        # 输入框发送结果：主线程渲染并复制到剪贴板
+        try:
+            while True:
+                r = self.send_done_q.get_nowait()
+                ov = self.overlays.get(r.get("channel"))
                 if ov is not None:
-                    ov.add_message(item)
+                    ov._on_send_result(r)
         except queue.Empty:
             pass
         self.root.after(120, self._poll_done)
 
     def _update_ctrl_label(self):
         char = get("eve.character", "")
-        chans = ", ".join(self.overlays.keys()) or "无"
+        with self._lock:
+            chans = ", ".join(self.overlays.keys()) or "无"
         pend = self.raw_q.qsize()
         self.status_lbl.configure(
             text=f"角色：{char or '未选择'}\n窗口：{chans}\n待翻译：{pend}")
@@ -649,7 +903,7 @@ class OverlayApp:
         self.root.after(1000, self._tick_status)
 
     def _apply_style(self):
-        self.root.attributes("-alpha", float(get("window.opacity", 0.85)))
+        self.root.attributes("-alpha", float(get("window.opacity", _WDEF["opacity"])))
         for ov in self.overlays.values():
             ov._apply_style()
 
@@ -672,8 +926,8 @@ class OverlayApp:
         v_target = tk.StringVar(value=get("translation.target_language", "简体中文"))
         v_logdir = tk.StringVar(value=get("eve.log_dir", ""))
         v_char = tk.StringVar(value=get("eve.character", ""))
-        v_opacity = tk.DoubleVar(value=float(get("window.opacity", 0.85)))
-        v_font = tk.IntVar(value=int(get("window.font_size", 10)))
+        v_opacity = tk.DoubleVar(value=float(get("window.opacity", _WDEF["opacity"])))
+        v_font = tk.IntVar(value=int(get("window.font_size", _WDEF["font_size"])))
 
         def row(label):
             f = tk.Frame(dlg, bg=BG)

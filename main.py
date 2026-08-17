@@ -22,9 +22,7 @@ def _setup_exception_logging():
         print(msg, file=sys.stderr)
         try:
             import config
-            log_path = os.path.join(config.APP_DIR, "error.log")
-            with open(log_path, "a", encoding="utf-8") as f:
-                f.write(msg + "\n")
+            config.log_error("未捕获异常", msg)
         except Exception:
             pass
 
