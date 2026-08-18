@@ -35,14 +35,14 @@ jobs:
         shell: pwsh
         run: |
           $short = $env:GITHUB_SHA.Substring(0, 7)
-          Move-Item "dist\EVE频道翻译.exe" "dist\EVE频道翻译-$short.exe" -Force
+          Move-Item "dist\EVE-channel-trans.exe" "dist\EVE-channel-trans-$short.exe" -Force
           "short=$short" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: EVE频道翻译-exe
-          path: dist/EVE频道翻译*.exe
+          name: EVE-channel-trans-exe
+          path: dist/EVE-channel-trans*.exe
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -51,4 +51,4 @@ jobs:
           name: Auto build ${{ env.short }}
           body: |
             自动构建（commit `${{ github.sha }}`）
-          files: dist/EVE频道翻译-${{ env.short }}.exe
+          files: dist/EVE-channel-trans-${{ env.short }}.exe
