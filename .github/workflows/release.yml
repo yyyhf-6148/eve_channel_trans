@@ -1,12 +1,11 @@
 name: Build & Release
 
-# 触发方式：
-#   1) 推送版本标签：git tag v1.3.0 && git push origin v1.3.0
-#   2) 或手动在 Actions 页面点 Run workflow
+# 每次推送到 main 自动打包 exe 并创建 GitHub Release；
+# 也可手动在 Actions 页面点 Run workflow。
 on:
   push:
-    tags:
-      - 'v*'
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
@@ -32,22 +31,24 @@ jobs:
       - name: Build exe (PyInstaller onefile)
         run: pyinstaller --noconfirm --clean build.spec
 
-      - name: Rename exe with version tag
-        if: startsWith(github.ref, 'refs/tags/')
+      - name: Rename exe with commit
         shell: pwsh
         run: |
-          $tag = $env:GITHUB_REF_NAME
-          Move-Item "dist\EVE频道翻译.exe" "dist\EVE频道翻译-$tag.exe" -Force
+          $short = $env:GITHUB_SHA.Substring(0, 7)
+          Move-Item "dist\EVE频道翻译.exe" "dist\EVE频道翻译-$short.exe" -Force
+          "short=$short" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Upload artifact (debug/manual runs)
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: EVE频道翻译-exe
           path: dist/EVE频道翻译*.exe
 
       - name: Create GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/EVE频道翻译-${{ github.ref_name }}.exe
-          generate_release_notes: true
+          tag_name: auto-${{ env.short }}
+          name: Auto build ${{ env.short }}
+          body: |
+            自动构建（commit `${{ github.sha }}`）
+          files: dist/EVE频道翻译-${{ env.short }}.exe
