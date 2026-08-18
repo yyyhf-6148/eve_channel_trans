@@ -27,6 +27,10 @@ DEFAULTS = {
     },
     "translation": {
         "target_language": "简体中文",
+        "glossary": {
+            "www": "warp to me",
+            "nv": "no view",
+        },
     },
     "eve": {
         "log_dir": "",

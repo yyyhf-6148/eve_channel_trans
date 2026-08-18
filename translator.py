@@ -6,6 +6,7 @@
 - 对常见的 HTTP 错误分类为可重试/不可重试异常，供上层决定是否退避重试。
 """
 import os
+import re
 
 import requests
 
@@ -63,6 +64,34 @@ def _env(name):
     return os.environ.get(name, "").strip()
 
 
+def expand_glossary(text, glossary=None):
+    """把聊天黑话按词典本地展开（词边界、忽略大小写），0 token 开销。
+
+    替换发生在发送给 AI 之前，词典来自 config 的 translation.glossary，
+    用户在设置里可自行增删。返回替换后的文本。
+    """
+    if not text:
+        return text
+    if glossary is None:
+        glossary = get("translation.glossary", {}) or {}
+    if not glossary:
+        return text
+    # 长词先替换，避免短词先命中破坏长词
+    for term, expansion in sorted(glossary.items(),
+                                  key=lambda kv: len(kv[0]), reverse=True):
+        term = (term or "").strip()
+        if not term:
+            continue
+        try:
+            # (?<!\w)(?!\w) 等价词边界：只在独立成词时替换，避免误伤
+            # 如 nv 不会命中 env / nv1
+            pattern = rf"(?<!\w){re.escape(term)}(?!\w)"
+            text = re.sub(pattern, lambda m: expansion, text, flags=re.IGNORECASE)
+        except re.error:
+            continue
+    return text
+
+
 class Translator:
     """使用 OpenAI 兼容的 /chat/completions 接口做翻译，配置实时读取。"""
 
@@ -82,6 +111,11 @@ class Translator:
         timeout = float(get("api.timeout", 60) or 60)
         if not target:
             target = get("translation.target_language", "简体中文") or "简体中文"
+
+        # 第一层：本地黑话词典替换（0 token），再交给 AI
+        text = expand_glossary(text)
+        if context:
+            context = expand_glossary(context)
 
         url = f"{base}/chat/completions"
         headers = {"Content-Type": "application/json"}

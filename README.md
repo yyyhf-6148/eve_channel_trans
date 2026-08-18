@@ -20,6 +20,7 @@
   - 位置、大小、固定状态自动记忆，重启恢复
 - **一键发送翻译**：窗口底部输入框输入中文，回车 → 带上该频道最近 10 条消息作为上下文翻译成英文 → 自动复制到剪贴板，直接粘贴进游戏
   - 输入框右侧实时提示：`翻译中…` → `已复制` / `失败`
+- **聊天黑话词典**：游戏缩写（如 `www`=warp to me、`nv`=no view）在发送给 AI 前本地替换为英文规范含义，0 token 开销、100% 准确，再由 AI 翻译成目标语言；可在设置里随时增删词条
 - **深色主题**，字号 / 透明度可调
 
 ---
@@ -65,6 +66,7 @@ python main.py
 | `api.model` | 模型名称 | `deepseek-chat` |
 | `api.temperature` | 采样温度 | `0.3` |
 | `translation.target_language` | 聊天翻译目标语言 | `简体中文` |
+| `translation.glossary` | 聊天黑话词典（发送给 AI 前本地替换，0 token） | `{www: warp to me, nv: no view}` |
 | `eve.log_dir` | EVE 日志目录 | 空 |
 | `eve.character` | 游戏角色名 | 空 |
 | `eve.channels` | 需要翻译的频道列表 | `[]` |

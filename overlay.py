@@ -32,7 +32,7 @@ from translator import (NetworkError, RateLimitError, ServerError,
                         TranslationError, Translator)
 
 # 版本 / 作者信息（显示在设置窗口底部）
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 APP_AUTHOR = "MaoSama"
 
 # Windows 扩展样式
@@ -965,6 +965,12 @@ class OverlayApp:
         e_target = entry(row("目标语言"))
         e_target.configure(textvariable=v_target)
 
+        r_gloss = row("黑话词典")
+        sm_btn(r_gloss, "编辑…", self.open_glossary_editor)
+        tk.Label(r_gloss, text="本地替换游戏黑话，0 token",
+                 bg=BG, fg=FG_STATUS, font=("Microsoft YaHei UI", 8)
+                 ).pack(side="left", padx=(0, 6))
+
         r_log = row("日志目录")
         e_log = entry(r_log)
         e_log.configure(textvariable=v_logdir)
@@ -1102,6 +1108,61 @@ class OverlayApp:
 
         dlg.protocol("WM_DELETE_WINDOW", cancel)
         dlg.after(100, refresh_chars)
+
+    def open_glossary_editor(self, parent=None):
+        """黑话词典编辑窗口：每行一条「缩写 = 含义」，发送给 AI 前本地替换。"""
+        dlg = tk.Toplevel(self.root)
+        dlg.title("聊天黑话词典")
+        dlg.configure(bg=BG)
+        dlg.attributes("-topmost", True)
+        dlg.resizable(False, False)
+
+        hint = tk.Label(dlg, text="每行一条，格式：缩写 = 英文规范含义\n"
+                                  "发送给 AI 前先本地替换（独立成词才替换，忽略大小写），再由 AI 翻译\n"
+                                  "例：www = warp to me",
+                        bg=BG, fg=FG_STATUS, anchor="w", justify="left",
+                        font=("Microsoft YaHei UI", 9))
+        hint.pack(fill="x", padx=10, pady=(10, 4))
+
+        txt = tk.Text(dlg, width=44, height=14, bg="#1c242c", fg=FG,
+                      insertbackground=FG, relief="flat",
+                      font=("Microsoft YaHei UI", 10))
+        txt.pack(fill="both", expand=True, padx=10)
+        for term, exp in (get("translation.glossary", {}) or {}).items():
+            txt.insert("end", f"{term} = {exp}\n")
+
+        def save():
+            parsed = {}
+            for raw in txt.get("1.0", "end").splitlines():
+                line = raw.strip()
+                if not line:
+                    continue
+                if "=" in line:
+                    term, exp = line.split("=", 1)
+                else:
+                    parts = line.split()
+                    if len(parts) < 2:
+                        continue
+                    term, exp = parts[0], " ".join(parts[1:])
+                term, exp = term.strip(), exp.strip()
+                if term:
+                    parsed[term] = exp
+            cfg_set("translation.glossary", parsed)
+            save_config()
+            dlg.destroy()
+
+        def cancel():
+            dlg.destroy()
+
+        btnf = tk.Frame(dlg, bg=BG)
+        btnf.pack(fill="x", padx=10, pady=(6, 10))
+        tk.Button(btnf, text="保存", command=save, bg=BTN_BG, fg=FG, relief="flat",
+                  cursor="hand2", padx=16, pady=3, activebackground=BTN_ACTIVE,
+                  activeforeground="#ffffff").pack(side="right")
+        tk.Button(btnf, text="取消", command=cancel, bg="#2d333b", fg=FG, relief="flat",
+                  cursor="hand2", padx=16, pady=3, activebackground="#444c56",
+                  activeforeground="#ffffff").pack(side="right", padx=6)
+        dlg.protocol("WM_DELETE_WINDOW", cancel)
 
     # ---------- 生命周期 ----------
     def quit_app(self):
