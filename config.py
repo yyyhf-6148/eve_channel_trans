@@ -21,7 +21,7 @@ DEFAULTS = {
         # OpenAI 兼容接口，例如 https://api.deepseek.com
         "base_url": "https://api.deepseek.com",
         "api_key": "",
-        "model": "deepseek-chat",
+        "model": "deepseek-v4-flash",
         "temperature": 0.3,
         "timeout": 60,
     },

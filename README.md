@@ -63,7 +63,7 @@ python main.py
 |---|---|---|
 | `api.base_url` | OpenAI 兼容接口地址 | `https://api.deepseek.com` |
 | `api.api_key` | API 密钥 | 空 |
-| `api.model` | 模型名称 | `deepseek-chat` |
+| `api.model` | 模型名称 | `deepseek-v4-flash` |
 | `api.temperature` | 采样温度 | `0.3` |
 | `translation.target_language` | 聊天翻译目标语言 | `简体中文` |
 | `translation.glossary` | 聊天黑话词典（发送给 AI 前本地替换，0 token） | `{www: warp to me, nv: no view}` |
